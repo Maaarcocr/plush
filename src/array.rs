@@ -2,54 +2,139 @@ use crate::vm::{Value, Actor};
 use crate::alloc::Alloc;
 use crate::host::HostFn;
 
-#[derive(Clone, Default)]
 pub struct Array
 {
-    pub elems: Vec<Value>,
+    pub elems: *mut [Value],
+    pub len: usize,
 }
 
 impl Array
 {
-    pub fn with_capacity(cap: u32) -> Self
+    pub fn with_capacity(capacity: usize, alloc: &mut Alloc) -> Self
     {
-        Self {
-            elems: Vec::with_capacity(cap as usize)
+        let table = alloc.alloc_table(capacity);
+        Array { elems: table, len: 0 }
+    }
+
+    pub fn clone(&self, alloc: &mut Alloc) -> Self
+    {
+        let table = alloc.alloc_table(self.len);
+        let mut arr = Array { elems: table, len: self.len };
+        arr.items_mut().copy_from_slice(self.items());
+        arr
+    }
+
+    pub fn items(&self) -> &[Value] {
+        unsafe { &(*self.elems)[..self.len] }
+    }
+
+    pub fn items_mut(&mut self) -> &mut [Value] {
+        unsafe { &mut (*self.elems)[..self.len] }
+    }
+
+    pub fn push(&mut self, val: Value, alloc: &mut Alloc)
+    {
+        if self.len == self.elems.len() {
+            let new_len = self.len * 2 + 1;
+            let new_elems = alloc.alloc_table(new_len);
+            unsafe {
+                (&mut *new_elems)[..self.len].copy_from_slice(&(*self.elems)[..self.len]);
+                self.elems = new_elems;
+            }
+        }
+        unsafe {
+            (&mut *self.elems)[self.len] = val;
+            self.len += 1;
         }
     }
 
-    pub fn push(&mut self, val: Value)
+    pub fn insert(&mut self, idx: usize, val: Value, alloc: &mut Alloc)
     {
-        self.elems.push(val);
+        if self.len == self.elems.len() {
+            let new_len = self.len * 2 + 1;
+            let new_elems = alloc.alloc_table(new_len);
+            unsafe {
+                (&mut *new_elems).copy_from_slice(&(*self.elems)[..self.len]);
+                self.elems = new_elems;
+            }
+        }
+        unsafe {
+            (&mut *self.elems).copy_within(idx..self.len, idx + 1);
+            (&mut *self.elems)[idx] = val;
+            self.len += 1;
+        }
+    }
+
+    pub fn remove(&mut self, idx: usize) -> Value
+    {
+        if idx >= self.len {
+            return Value::Nil;
+        }
+
+        let removed = unsafe { (&mut *self.elems)[idx] };
+        unsafe {
+            (&mut *self.elems).copy_within(idx + 1..self.len, idx);
+        }
+
+        self.len -= 1;
+        removed
+    }
+
+    pub fn extend(&mut self, other: &Array, alloc: &mut Alloc) {
+        let other_elems = other.elems;
+        if self.len + other_elems.len() > self.elems.len() {
+            let new_len = self.len + other_elems.len();
+            let new_elems = alloc.alloc_table(new_len);
+            unsafe {
+                (&mut *new_elems)[..self.len].copy_from_slice(&(*self.elems)[..self.len]);
+                (&mut *new_elems)[self.len..].copy_from_slice(&(*other_elems)[..other_elems.len()]);
+                self.elems = new_elems;
+            }
+        } else {
+            unsafe {
+                (&mut *self.elems)[self.len..].copy_from_slice(&(*other_elems)[..other_elems.len()]);
+            }
+        }
+        self.len += other_elems.len();
     }
 
     pub fn pop(&mut self) -> Value
     {
-        self.elems.pop().unwrap()
+        if self.len == 0 {
+            return Value::Nil;
+        }
+
+        self.len -= 1;
+        unsafe { (*self.elems) [self.len] }
     }
 
     pub fn get(&self, idx: usize) -> Value
     {
-        self.elems[idx]
+        unsafe { (*self.elems) [idx] }
     }
 
     pub fn set(&mut self, idx: usize, val: Value)
     {
-        self.elems[idx] = val;
+        unsafe { (*self.elems) [idx] = val };
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
     }
 }
 
 pub fn array_with_size(actor: &mut Actor, _self: Value, num_elems: Value, fill_val: Value) -> Result<Value, String>
 {
     let num_elems = num_elems.unwrap_usize();
-    let mut elems = Vec::with_capacity(num_elems);
-    elems.resize(num_elems, fill_val);
-    let arr = Array { elems };
+    let mut elems = actor.alloc.alloc_table(num_elems);
+    unsafe { (&mut *elems).fill(fill_val); }
+    let arr = Array { elems, len: num_elems };
     Ok(Value::Array(actor.alloc.alloc(arr)))
 }
 
 pub fn array_push(actor: &mut Actor, mut array: Value, val: Value) -> Result<Value, String>
 {
-    array.unwrap_arr().push(val);
+    array.unwrap_arr().push(val, &mut actor.alloc);
     Ok(Value::Nil)
 }
 
@@ -61,19 +146,19 @@ pub fn array_pop(actor: &mut Actor, mut array: Value) -> Result<Value, String>
 pub fn array_remove(actor: &mut Actor, mut array: Value, idx: Value) -> Result<Value, String>
 {
     let idx = idx.unwrap_usize();
-    Ok(array.unwrap_arr().elems.remove(idx))
+    Ok(array.unwrap_arr().remove(idx))
 }
 
 pub fn array_insert(actor: &mut Actor, mut array: Value, idx: Value, val: Value) -> Result<Value, String>
 {
     let idx = idx.unwrap_usize();
-    array.unwrap_arr().elems.insert(idx, val);
+    array.unwrap_arr().insert(idx, val, &mut actor.alloc);
     Ok(Value::Nil)
 }
 
-pub fn array_append(_actor: &mut Actor, mut self_array: Value, mut other_array: Value) -> Result<Value, String>
+pub fn array_append(actor: &mut Actor, mut self_array: Value, mut other_array: Value) -> Result<Value, String>
 {
-    let other_elems = other_array.unwrap_arr().elems.clone();
-    self_array.unwrap_arr().elems.extend(other_elems);
+    let other_elems = other_array.unwrap_arr();
+    self_array.unwrap_arr().extend(other_elems, &mut actor.alloc);
     Ok(Value::Nil)
 }
