@@ -16,6 +16,418 @@ use crate::deepcopy::{deepcopy, remap};
 use crate::host::*;
 use crate::str::Str;
 
+#[derive(PartialEq, Copy, Clone, Debug)]
+#[allow(non_camel_case_types)]
+enum Opcode {
+    panic { src_pos_idx: u32 },
+    nop,
+    push { val_idx: u32 },
+    pop,
+    dup,
+    swap,
+    getn { idx: u32 },
+    get_arg { idx: u32 },
+    get_local { idx: u32 },
+    set_local { idx: u32 },
+    get_global { idx: u32 },
+    set_global { idx: u32 },
+    add,
+    sub,
+    mul,
+    div,
+    div_int,
+    modulo,
+    add_i64 { payload: i32 },
+    bit_and,
+    bit_or,
+    bit_xor,
+    lshift,
+    rshift,
+    lt,
+    le,
+    gt,
+    ge,
+    eq,
+    ne,
+    not,
+    clos_new { entry_idx: u32 },
+    clos_set { idx: u32 },
+    clos_get { idx: u32 },
+    cell_new,
+    cell_set,
+    cell_get,
+    new { entry_idx: u32 },
+    new_known_ctor { entry_idx: u32 },
+    instanceof { class_id: ClassId },
+    get_field { entry_idx: u32 },
+    set_field { entry_idx: u32 },
+    get_index,
+    set_index,
+    dict_new,
+    arr_new { capacity: u32 },
+    arr_push,
+    ba_clone,
+    if_true { target_ofs: i32 },
+    if_false { target_ofs: i32 },
+    jump { target_ofs: i32 },
+    call { argc: u32 },
+    call_direct { entry_idx: u32 },
+    call_pc { entry_idx: u32 },
+    call_method { entry_idx: u32 },
+    call_method_pc { entry_idx: u32 },
+    ret,
+}
+
+#[derive(Copy, Clone)]
+union OptmisedInsn {
+    opcode: Opcode,
+    index: usize,
+}
+
+impl OptmisedInsn {
+    fn as_opcode(self) -> Opcode {
+        unsafe { self.opcode }
+    }
+
+    fn as_index(self) -> usize {
+        unsafe { self.index }
+    }
+}
+
+#[derive(Copy, Clone)]
+struct CallPcEntry {
+    entry_pc: u32,
+    fun_id: FunId,
+    num_locals: u16,
+    argc: u8,
+}
+
+#[derive(Copy, Clone)]
+struct CallMethodPcEntry {
+    name: *const Str,
+    argc: u8,
+    class_id: ClassId,
+    entry_pc: u32,
+    fun_id: FunId,
+    num_locals: u16,
+}
+
+#[derive(Copy, Clone)]
+struct NewKnownCtorEntry {
+    class_id: ClassId,
+    argc: u8,
+    num_slots: u16,
+    ctor_pc: u32,
+    fun_id: FunId,
+    num_locals: u16,
+}
+
+#[derive(Copy, Clone)]
+struct GetFieldEntry {
+    field: *const Str,
+    class_id: ClassId,
+    slot_idx: u32,
+}
+
+#[derive(Copy, Clone)]
+struct SetFieldEntry {
+    field: *const Str,
+    class_id: ClassId,
+    slot_idx: u32,
+}
+
+#[derive(Copy, Clone)]
+struct ClosNewEntry {
+    fun_id: FunId,
+    num_slots: u32,
+}
+
+#[derive(Copy, Clone)]
+struct NewEntry {
+    class_id: ClassId,
+    argc: u8,
+}
+
+#[derive(Copy, Clone)]
+struct CallDirectEntry {
+    fun_id: FunId,
+    argc: u8,
+}
+
+#[derive(Copy, Clone)]
+struct CallMethodEntry {
+    name: *const Str,
+    argc: u8,
+}
+
+#[derive(Default)]
+struct Bytecode {
+    isns: Vec<OptmisedInsn>,
+    src_pos: Vec<SrcPos>,
+    vals: Vec<Value>,
+    call_pc_entries: Vec<CallPcEntry>,
+    call_method_pc_entries: Vec<CallMethodPcEntry>,
+    new_known_ctor_entries: Vec<NewKnownCtorEntry>,
+    get_field_entries: Vec<GetFieldEntry>,
+    set_field_entries: Vec<SetFieldEntry>,
+    clos_new_entries: Vec<ClosNewEntry>,
+    new_entries: Vec<NewEntry>,
+    call_direct_entries: Vec<CallDirectEntry>,
+    call_method_entries: Vec<CallMethodEntry>,
+}
+
+impl Bytecode {
+    fn len(&self) -> usize {
+        self.isns.len()
+    }
+
+    fn append_from_insns(&mut self, insns: &[Insn]) -> u32 {
+        let start_pc = self.isns.len() as u32;
+        for insn in insns {
+            self.lower_insn(*insn);
+        }
+        start_pc
+    }
+
+    fn lower_insn(&mut self, insn: Insn) {
+        let opcode = match insn {
+            Insn::panic { pos } => {
+                let idx = self.src_pos.len() as u32;
+                self.src_pos.push(pos);
+                Opcode::panic { src_pos_idx: idx }
+            }
+            Insn::nop => Opcode::nop,
+            Insn::push { val } => {
+                let val_idx = self.add_val(val);
+                Opcode::push { val_idx }
+            }
+            Insn::pop => Opcode::pop,
+            Insn::dup => Opcode::dup,
+            Insn::swap => Opcode::swap,
+            Insn::getn { idx } => Opcode::getn { idx: idx as u32 },
+            Insn::get_arg { idx } => Opcode::get_arg { idx },
+            Insn::get_local { idx } => Opcode::get_local { idx },
+            Insn::set_local { idx } => Opcode::set_local { idx },
+            Insn::get_global { idx } => Opcode::get_global { idx },
+            Insn::set_global { idx } => Opcode::set_global { idx },
+            Insn::add => Opcode::add,
+            Insn::sub => Opcode::sub,
+            Insn::mul => Opcode::mul,
+            Insn::div => Opcode::div,
+            Insn::div_int => Opcode::div_int,
+            Insn::modulo => Opcode::modulo,
+            Insn::add_i64 { val } => {
+                // Inline small immediates in the opcode; otherwise spill the payload into
+                // the next word (OptmisedInsn) to avoid growing the constant pool.
+                let payload = if val <= i32::MAX as i64 && val >= i32::MIN as i64 && val != i32::MAX as i64 {
+                    val as i32
+                } else {
+                    i32::MAX
+                };
+                self.isns.push(OptmisedInsn { opcode: Opcode::add_i64 { payload } });
+                if payload == i32::MAX {
+                    self.isns.push(OptmisedInsn { index: val as usize });
+                }
+                return;
+            }
+            Insn::bit_and => Opcode::bit_and,
+            Insn::bit_or => Opcode::bit_or,
+            Insn::bit_xor => Opcode::bit_xor,
+            Insn::lshift => Opcode::lshift,
+            Insn::rshift => Opcode::rshift,
+            Insn::lt => Opcode::lt,
+            Insn::le => Opcode::le,
+            Insn::gt => Opcode::gt,
+            Insn::ge => Opcode::ge,
+            Insn::eq => Opcode::eq,
+            Insn::ne => Opcode::ne,
+            Insn::not => Opcode::not,
+            Insn::clos_new { fun_id, num_slots } => {
+                let entry_idx = self.add_clos_new_entry(ClosNewEntry { fun_id, num_slots });
+                Opcode::clos_new { entry_idx }
+            }
+            Insn::clos_set { idx } => Opcode::clos_set { idx },
+            Insn::clos_get { idx } => Opcode::clos_get { idx },
+            Insn::cell_new => Opcode::cell_new,
+            Insn::cell_set => Opcode::cell_set,
+            Insn::cell_get => Opcode::cell_get,
+            Insn::new { class_id, argc } => {
+                let entry_idx = self.add_new_entry(NewEntry { class_id, argc });
+                Opcode::new { entry_idx }
+            }
+            Insn::new_known_ctor { class_id, argc, num_slots, ctor_pc, fun_id, num_locals } => {
+                let entry_idx = self.add_new_known_ctor_entry(NewKnownCtorEntry {
+                    class_id,
+                    argc,
+                    num_slots,
+                    ctor_pc,
+                    fun_id,
+                    num_locals,
+                });
+                Opcode::new_known_ctor { entry_idx }
+            }
+            Insn::instanceof { class_id } => {
+                Opcode::instanceof { class_id }
+            }
+            Insn::get_field { field, class_id, slot_idx } => {
+                let entry_idx = self.add_get_field_entry(GetFieldEntry { field, class_id, slot_idx });
+                Opcode::get_field { entry_idx }
+            }
+            Insn::set_field { field, class_id, slot_idx } => {
+                let entry_idx = self.add_set_field_entry(SetFieldEntry { field, class_id, slot_idx });
+                Opcode::set_field { entry_idx }
+            }
+            Insn::get_index => Opcode::get_index,
+            Insn::set_index => Opcode::set_index,
+            Insn::dict_new => Opcode::dict_new,
+            Insn::arr_new { capacity } => Opcode::arr_new { capacity },
+            Insn::arr_push => Opcode::arr_push,
+            Insn::ba_clone => Opcode::ba_clone,
+            Insn::if_true { target_ofs } => Opcode::if_true { target_ofs },
+            Insn::if_false { target_ofs } => Opcode::if_false { target_ofs },
+            Insn::jump { target_ofs } => Opcode::jump { target_ofs },
+            Insn::call { argc } => Opcode::call { argc: argc as u32 },
+            Insn::call_direct { fun_id, argc } => {
+                let entry_idx = self.add_call_direct_entry(CallDirectEntry { fun_id, argc });
+                Opcode::call_direct { entry_idx }
+            }
+            Insn::call_pc { entry_pc, fun_id, num_locals, argc } => {
+                let entry_idx = self.add_call_pc_entry(CallPcEntry { entry_pc, fun_id, num_locals, argc });
+                Opcode::call_pc { entry_idx }
+            }
+            Insn::call_method { name, argc } => {
+                let entry_idx = self.add_call_method_entry(CallMethodEntry { name, argc });
+                Opcode::call_method { entry_idx }
+            }
+            Insn::call_method_pc { name, argc, class_id, entry_pc, fun_id, num_locals } => {
+                let entry_idx = self.add_call_method_pc_entry(CallMethodPcEntry {
+                    name,
+                    argc,
+                    class_id,
+                    entry_pc,
+                    fun_id,
+                    num_locals,
+                });
+                Opcode::call_method_pc { entry_idx }
+            }
+            Insn::ret => Opcode::ret,
+        };
+
+        self.isns.push(OptmisedInsn { opcode });
+    }
+
+    fn add_val(&mut self, val: Value) -> u32 {
+        let idx = self.vals.len() as u32;
+        self.vals.push(val);
+        idx
+    }
+
+    fn add_call_pc_entry(&mut self, entry: CallPcEntry) -> u32 {
+        let idx = self.call_pc_entries.len() as u32;
+        self.call_pc_entries.push(entry);
+        idx
+    }
+
+    fn add_call_method_pc_entry(&mut self, entry: CallMethodPcEntry) -> u32 {
+        let idx = self.call_method_pc_entries.len() as u32;
+        self.call_method_pc_entries.push(entry);
+        idx
+    }
+
+    fn add_new_known_ctor_entry(&mut self, entry: NewKnownCtorEntry) -> u32 {
+        let idx = self.new_known_ctor_entries.len() as u32;
+        self.new_known_ctor_entries.push(entry);
+        idx
+    }
+
+    fn add_get_field_entry(&mut self, entry: GetFieldEntry) -> u32 {
+        let idx = self.get_field_entries.len() as u32;
+        self.get_field_entries.push(entry);
+        idx
+    }
+
+    fn add_set_field_entry(&mut self, entry: SetFieldEntry) -> u32 {
+        let idx = self.set_field_entries.len() as u32;
+        self.set_field_entries.push(entry);
+        idx
+    }
+
+    fn add_clos_new_entry(&mut self, entry: ClosNewEntry) -> u32 {
+        let idx = self.clos_new_entries.len() as u32;
+        self.clos_new_entries.push(entry);
+        idx
+    }
+
+    fn add_new_entry(&mut self, entry: NewEntry) -> u32 {
+        let idx = self.new_entries.len() as u32;
+        self.new_entries.push(entry);
+        idx
+    }
+
+    fn add_call_direct_entry(&mut self, entry: CallDirectEntry) -> u32 {
+        let idx = self.call_direct_entries.len() as u32;
+        self.call_direct_entries.push(entry);
+        idx
+    }
+
+    fn add_call_method_entry(&mut self, entry: CallMethodEntry) -> u32 {
+        let idx = self.call_method_entries.len() as u32;
+        self.call_method_entries.push(entry);
+        idx
+    }
+
+    fn src_position(&self, idx: u32) -> SrcPos {
+        self.src_pos[idx as usize]
+    }
+
+    fn value(&self, idx: u32) -> Value {
+        self.vals[idx as usize]
+    }
+
+    fn str_ptr(&self, idx: u32) -> *const Str {
+        match self.value(idx) {
+            Value::String(s) => s,
+            _ => panic!("expected string at idx {}", idx),
+        }
+    }
+
+    fn call_pc_entry(&self, idx: u32) -> CallPcEntry {
+        self.call_pc_entries[idx as usize]
+    }
+
+    fn call_method_pc_entry(&self, idx: u32) -> CallMethodPcEntry {
+        self.call_method_pc_entries[idx as usize]
+    }
+
+    fn new_known_ctor_entry(&self, idx: u32) -> NewKnownCtorEntry {
+        self.new_known_ctor_entries[idx as usize]
+    }
+
+    fn get_field_entry(&self, idx: u32) -> GetFieldEntry {
+        self.get_field_entries[idx as usize]
+    }
+
+    fn set_field_entry(&self, idx: u32) -> SetFieldEntry {
+        self.set_field_entries[idx as usize]
+    }
+
+    fn clos_new_entry(&self, idx: u32) -> ClosNewEntry {
+        self.clos_new_entries[idx as usize]
+    }
+
+    fn new_entry(&self, idx: u32) -> NewEntry {
+        self.new_entries[idx as usize]
+    }
+
+    fn call_direct_entry(&self, idx: u32) -> CallDirectEntry {
+        self.call_direct_entries[idx as usize]
+    }
+
+    fn call_method_entry(&self, idx: u32) -> CallMethodEntry {
+        self.call_method_entries[idx as usize]
+    }
+}
+
 /// Instruction opcodes
 /// Note: commonly used upcodes should be in the [0, 127] range (one byte)
 ///       less frequently used opcodes can take multiple bytes if necessary.
@@ -564,7 +976,7 @@ pub struct Actor
     funs: HashMap<FunId, CompiledFun>,
 
     // Array of compiled instructions
-    insns: Vec<Insn>,
+    insns: Bytecode,
 }
 
 impl Actor
@@ -589,7 +1001,7 @@ impl Actor
             actor_map: HashMap::default(),
             stack: Vec::default(),
             frames: Vec::default(),
-            insns: Vec::default(),
+            insns: Bytecode::default(),
             classes: HashMap::default(),
             funs: HashMap::default(),
         }
@@ -713,9 +1125,16 @@ impl Actor
         }
 
         // Borrow the function from the VM and compile it
-        let vm = self.vm.lock().unwrap();
-        let fun = &vm.prog.funs[&fun_id];
-        let entry = fun.gen_code(&mut self.insns, &mut self.alloc).unwrap();
+        let (mut entry, insns) = {
+            let vm = self.vm.lock().unwrap();
+            let fun = &vm.prog.funs[&fun_id];
+            let mut insn_buf = Vec::new();
+            let entry = fun.gen_code(&mut insn_buf, &mut self.alloc).unwrap();
+            (entry, insn_buf)
+        };
+
+        let start_pc = self.insns.append_from_insns(&insns);
+        entry.entry_pc = start_pc as usize;
         self.funs.insert(fun_id, entry);
 
         // Return the compiled function entry
@@ -847,23 +1266,21 @@ impl Actor
                 deepcopy(frame.fun, dst_alloc, dst_map)?;
             }
 
-            // Copy heap values referenced in instructions
-            for insn in &mut actor.insns {
-                match insn {
-                    Insn::push { val } => {
-                        deepcopy(*val, dst_alloc, dst_map)?;
-                    }
-
-                    // Instructions referencing name strings
-                    Insn::get_field { field: s, .. } |
-                    Insn::set_field { field: s, .. } |
-                    Insn::call_method { name: s, .. } |
-                    Insn::call_method_pc { name: s, .. } => {
-                        deepcopy(Value::String(*s), dst_alloc, dst_map)?;
-                    }
-
-                    _ => {}
-                }
+            // Copy heap values referenced in instructions and side tables
+            for val in &mut actor.insns.vals {
+                deepcopy(*val, dst_alloc, dst_map)?;
+            }
+            for entry in &actor.insns.get_field_entries {
+                deepcopy(Value::String(entry.field), dst_alloc, dst_map)?;
+            }
+            for entry in &actor.insns.set_field_entries {
+                deepcopy(Value::String(entry.field), dst_alloc, dst_map)?;
+            }
+            for entry in &actor.insns.call_method_entries {
+                deepcopy(Value::String(entry.name), dst_alloc, dst_map)?;
+            }
+            for entry in &actor.insns.call_method_pc_entries {
+                deepcopy(Value::String(entry.name), dst_alloc, dst_map)?;
             }
 
             // Copy extra roots supplied by the user
@@ -942,25 +1359,32 @@ impl Actor
             frame.fun = get_new_val(frame.fun, &dst_map);
         }
 
-        // Remap heap values referenced in instructions
-        for insn in &mut self.insns {
-            match insn {
-                Insn::push { val } => {
-                    *val = get_new_val(*val, &dst_map);
-                }
-
-                // Instructions referencing name strings
-                Insn::get_field { field: s, .. } |
-                Insn::set_field { field: s, .. } |
-                Insn::call_method { name: s, .. } |
-                Insn::call_method_pc { name: s, .. } => {
-                    match get_new_val(Value::String(*s), &dst_map) {
-                        Value::String(new_s) => *s = new_s,
-                        _ => panic!(),
-                    }
-                }
-
-                _ => {}
+        // Remap heap values referenced in instructions and side tables
+        for val in &mut self.insns.vals {
+            *val = get_new_val(*val, &dst_map);
+        }
+        for entry in &mut self.insns.get_field_entries {
+            match get_new_val(Value::String(entry.field), &dst_map) {
+                Value::String(new_s) => entry.field = new_s,
+                _ => panic!(),
+            }
+        }
+        for entry in &mut self.insns.set_field_entries {
+            match get_new_val(Value::String(entry.field), &dst_map) {
+                Value::String(new_s) => entry.field = new_s,
+                _ => panic!(),
+            }
+        }
+        for entry in &mut self.insns.call_method_entries {
+            match get_new_val(Value::String(entry.name), &dst_map) {
+                Value::String(new_s) => entry.name = new_s,
+                _ => panic!(),
+            }
+        }
+        for entry in &mut self.insns.call_method_pc_entries {
+            match get_new_val(Value::String(entry.name), &dst_map) {
+                Value::String(new_s) => entry.name = new_s,
+                _ => panic!(),
             }
         }
 
@@ -1225,46 +1649,47 @@ impl Actor
                 error!("pc out of bounds");
             }
 
-            let insn = self.insns[pc];
+            let opcode = self.insns.isns[pc].as_opcode();
             pc += 1;
             //println!("executing {:?}", insn);
             //println!("stack size: {}, executing {:?}", self.stack.len(), insn);
 
-            match insn {
-                Insn::nop => {},
+            match opcode {
+                Opcode::nop => {},
 
-                Insn::panic { pos } => {
+                Opcode::panic { src_pos_idx } => {
+                    let pos = self.insns.src_position(src_pos_idx);
                     error!("explicit panic at: {}", pos);
                 }
 
-                Insn::push { val } => {
-                   self.stack.push(val);
+                Opcode::push { val_idx } => {
+                   self.stack.push(self.insns.value(val_idx));
                 }
 
-                Insn::dup => {
+                Opcode::dup => {
                     let val = pop!();
                     push!(val);
                     push!(val);
                 }
 
-                Insn::pop => {
+                Opcode::pop => {
                     pop!();
                 }
 
-                Insn::swap => {
+                Opcode::swap => {
                     let a = pop!();
                     let b = pop!();
                     push!(a);
                     push!(b);
                 }
 
-                Insn::getn { idx } => {
+                Opcode::getn { idx } => {
                     let idx = idx as usize;
                     let val = self.stack[self.stack.len() - (1 + idx)];
                     push!(val);
                 }
 
-                Insn::get_arg { idx } => {
+                Opcode::get_arg { idx } => {
                     let argc = self.frames[self.frames.len() - 1].argc as usize;
                     let idx = idx as usize;
 
@@ -1284,7 +1709,7 @@ impl Actor
                     //println!("arg_val={:?}", arg_val);
                 }
 
-                Insn::get_local { idx } => {
+                Opcode::get_local { idx } => {
                     let idx = idx as usize;
 
                     if bp + idx >= self.stack.len() {
@@ -1294,7 +1719,7 @@ impl Actor
                     push!(self.stack[bp + idx]);
                 }
 
-                Insn::set_local { idx } => {
+                Opcode::set_local { idx } => {
                     let idx = idx as usize;
                     let val = pop!();
 
@@ -1305,7 +1730,7 @@ impl Actor
                     self.stack[bp + idx] = val;
                 }
 
-                Insn::get_global { idx } => {
+                Opcode::get_global { idx } => {
                     let idx = idx as usize;
 
                     if idx >= self.globals.len() {
@@ -1321,7 +1746,7 @@ impl Actor
                     push!(val);
                 }
 
-                Insn::set_global { idx } => {
+                Opcode::set_global { idx } => {
                     let idx = idx as usize;
                     let val = pop!();
 
@@ -1332,7 +1757,7 @@ impl Actor
                     self.globals[idx] = val;
                 }
 
-                Insn::add => {
+                Opcode::add => {
                     let mut v1 = pop!();
                     let mut v0 = pop!();
 
@@ -1363,7 +1788,7 @@ impl Actor
                     push!(r);
                 }
 
-                Insn::sub => {
+                Opcode::sub => {
                     let v1 = pop!();
                     let v0 = pop!();
 
@@ -1378,7 +1803,7 @@ impl Actor
                     push!(r);
                 }
 
-                Insn::mul => {
+                Opcode::mul => {
                     let v1 = pop!();
                     let v0 = pop!();
 
@@ -1394,7 +1819,7 @@ impl Actor
                 }
 
                 // Division by zero will cause a panic (this is intentional)
-                Insn::div => {
+                Opcode::div => {
                     let v1 = pop!();
                     let v0 = pop!();
 
@@ -1411,7 +1836,7 @@ impl Actor
 
                 // Integer division
                 // Division by zero will cause a panic (this is intentional)
-                Insn::div_int => {
+                Opcode::div_int => {
                     let v1 = pop!();
                     let v0 = pop!();
 
@@ -1424,7 +1849,7 @@ impl Actor
                 }
 
                 // Division by zero will cause a panic (this is intentional)
-                Insn::modulo => {
+                Opcode::modulo => {
                     let v1 = pop!();
                     let v0 = pop!();
 
@@ -1439,8 +1864,15 @@ impl Actor
                     push!(r);
                 }
 
-                // Add a constant int64 value
-                Insn::add_i64 { val } => {
+                // Add a constant int64 value (inline or extended payload)
+                Opcode::add_i64 { payload } => {
+                    let val = if payload != i32::MAX {
+                        payload as i64
+                    } else {
+                        let ext_bits = self.insns.isns[pc].as_index() as u64;
+                        pc += 1;
+                        ext_bits as i64
+                    };
                     if let Some(top_val) = self.stack.last_mut() {
                         match top_val {
                             Int64(v0) => *v0 += val,
@@ -1453,7 +1885,7 @@ impl Actor
                 }
 
                 // Integer bitwise or
-                Insn::bit_or => {
+                Opcode::bit_or => {
                     let v1 = pop!();
                     let v0 = pop!();
 
@@ -1466,7 +1898,7 @@ impl Actor
                 }
 
                 // Integer bitwise and
-                Insn::bit_and => {
+                Opcode::bit_and => {
                     let v1 = pop!();
                     let v0 = pop!();
 
@@ -1479,7 +1911,7 @@ impl Actor
                 }
 
                 // Integer bitwise XOR
-                Insn::bit_xor => {
+                Opcode::bit_xor => {
                     let v1 = pop!();
                     let v0 = pop!();
 
@@ -1492,7 +1924,7 @@ impl Actor
                 }
 
                 // Integer left shift
-                Insn::lshift => {
+                Opcode::lshift => {
                     let v1 = pop!();
                     let v0 = pop!();
 
@@ -1505,7 +1937,7 @@ impl Actor
                 }
 
                 // Integer right shift
-                Insn::rshift => {
+                Opcode::rshift => {
                     let v1 = pop!();
                     let v0 = pop!();
 
@@ -1518,7 +1950,7 @@ impl Actor
                 }
 
                 // Less than
-                Insn::lt => {
+                Opcode::lt => {
                     let v1 = pop!();
                     let v0 = pop!();
 
@@ -1541,7 +1973,7 @@ impl Actor
                 }
 
                 // Less than or equal
-                Insn::le => {
+                Opcode::le => {
                     let v1 = pop!();
                     let v0 = pop!();
 
@@ -1564,7 +1996,7 @@ impl Actor
                 }
 
                 // Greater than
-                Insn::gt => {
+                Opcode::gt => {
                     let v1 = pop!();
                     let v0 = pop!();
 
@@ -1587,7 +2019,7 @@ impl Actor
                 }
 
                 // Greater than or equal
-                Insn::ge => {
+                Opcode::ge => {
                     let v1 = pop!();
                     let v0 = pop!();
 
@@ -1609,20 +2041,20 @@ impl Actor
                     push_bool!(b);
                 }
 
-                Insn::eq => {
+                Opcode::eq => {
                     let v1 = pop!();
                     let v0 = pop!();
                     push_bool!(v0 == v1);
                 }
 
-                Insn::ne => {
+                Opcode::ne => {
                     let v1 = pop!();
                     let v0 = pop!();
                     push_bool!(v0 != v1);
                 }
 
                 // Logical negation
-                Insn::not => {
+                Opcode::not => {
                     let v0 = pop!();
 
                     let b = match v0 {
@@ -1635,8 +2067,10 @@ impl Actor
                 }
 
                 // Create a new closure
-                Insn::clos_new { fun_id, num_slots } => {
-                    let num_slots = num_slots as usize;
+                Opcode::clos_new { entry_idx } => {
+                    let entry = self.insns.clos_new_entry(entry_idx);
+                    let fun_id = entry.fun_id;
+                    let num_slots = entry.num_slots as usize;
 
                      self.gc_check(
                         std::mem::size_of::<Closure>() +
@@ -1649,7 +2083,7 @@ impl Actor
                 }
 
                 // Set a closure slot
-                Insn::clos_set { idx } => {
+                Opcode::clos_set { idx } => {
                     let val = pop!();
                     let clos = pop!();
 
@@ -1663,7 +2097,7 @@ impl Actor
                 }
 
                 // Get a closure slot for the function currently executing
-                Insn::clos_get { idx } => {
+                Opcode::clos_get { idx } => {
                     let fun = &self.frames[self.frames.len() - 1].fun;
 
                     let val = match fun {
@@ -1682,7 +2116,7 @@ impl Actor
                 }
 
                 // Create a new mutable cell
-                Insn::cell_new => {
+                Opcode::cell_new => {
                      self.gc_check(
                         std::mem::size_of::<Value>(),
                         &mut [],
@@ -1693,7 +2127,7 @@ impl Actor
                 }
 
                 // Set the value stored in a mutable cell
-                Insn::cell_set => {
+                Opcode::cell_set => {
                     let cell = pop!();
                     let val = pop!();
 
@@ -1704,7 +2138,7 @@ impl Actor
                 }
 
                 // Get the value stored in a mutable cell
-                Insn::cell_get => {
+                Opcode::cell_get => {
                     let cell = pop!();
 
                     let val = match cell {
@@ -1716,7 +2150,7 @@ impl Actor
                 }
 
                 // Create new empty dictionary
-                Insn::dict_new => {
+                Opcode::dict_new => {
                     self.gc_check(
                         size_of::<Dict>() + Dict::size_of_slot(),
                         &mut []
@@ -1727,7 +2161,11 @@ impl Actor
                 }
 
                 // Set object field
-                Insn::set_field { mut field, class_id, slot_idx } => {
+                Opcode::set_field { entry_idx } => {
+                    let entry = self.insns.set_field_entry(entry_idx);
+                    let mut field = entry.field;
+                    let class_id = entry.class_id;
+                    let slot_idx = entry.slot_idx;
                     let mut val = pop!();
                     let mut obj = pop!();
                     let mut field_name = unsafe { &*field };
@@ -1743,11 +2181,9 @@ impl Actor
                                 let class_id = obj.class_id;
 
                                 // Update the cache
-                                self.insns[pc - 1] = Insn::set_field {
-                                    field,
-                                    class_id,
-                                    slot_idx: slot_idx as u32,
-                                };
+                                let entry = SetFieldEntry { field, class_id, slot_idx: slot_idx as u32 };
+                                let entry_idx = self.insns.add_set_field_entry(entry);
+                                self.insns.isns[pc - 1] = OptmisedInsn { opcode: Opcode::set_field { entry_idx } };
 
                                 obj.set(slot_idx, val);
                             }
@@ -1774,7 +2210,10 @@ impl Actor
 
                 // Allocate a new class instance and call
                 // the constructor for the given class
-                Insn::new { class_id, argc } => {
+                Opcode::new { entry_idx } => {
+                    let entry = self.insns.new_entry(entry_idx);
+                    let class_id = entry.class_id;
+                    let argc = entry.argc;
                     let num_slots = self.get_num_slots(class_id);
 
                     self.gc_check(
@@ -1796,7 +2235,7 @@ impl Actor
                         let ctor_entry = call_fun!(Value::Fun(fun_id), argc + 1);
 
                         // Patch the instruction to avoid lookups next time
-                        self.insns[this_pc] = Insn::new_known_ctor {
+                        let entry = NewKnownCtorEntry {
                             class_id,
                             argc,
                             num_slots: num_slots.try_into().unwrap(),
@@ -1804,14 +2243,22 @@ impl Actor
                             fun_id,
                             num_locals: ctor_entry.num_locals.try_into().unwrap(),
                         };
+                        let entry_idx = self.insns.add_new_known_ctor_entry(entry);
+                        self.insns.isns[this_pc] = OptmisedInsn { opcode: Opcode::new_known_ctor { entry_idx } };
                     } else {
                         // Return the allocated object
                         push!(obj_val);
                     }
                 }
 
-                Insn::new_known_ctor { class_id, argc, num_slots, ctor_pc, fun_id, num_locals } => {
-                    let num_slots = num_slots as usize;
+                Opcode::new_known_ctor { entry_idx } => {
+                    let entry = self.insns.new_known_ctor_entry(entry_idx);
+                    let class_id = entry.class_id;
+                    let fun_id = entry.fun_id;
+                    let argc = entry.argc;
+                    let num_slots = entry.num_slots as usize;
+                    let ctor_pc = entry.ctor_pc;
+                    let num_locals = entry.num_locals;
 
                     self.gc_check(
                         std::mem::size_of::<Object>() +
@@ -1842,7 +2289,7 @@ impl Actor
                     self.stack.resize(self.stack.len() + num_locals as usize, Value::Nil);
                 }
 
-                Insn::instanceof { class_id } => {
+                Opcode::instanceof { class_id } => {
                     // Check that the class id matches
                     let mut val = pop!();
                     let id = crate::runtime::get_class_id(val);
@@ -1850,7 +2297,11 @@ impl Actor
                 }
 
                 // Get object field
-                Insn::get_field { field, class_id, slot_idx } => {
+                Opcode::get_field { entry_idx } => {
+                    let entry = self.insns.get_field_entry(entry_idx);
+                    let field = entry.field;
+                    let class_id = entry.class_id;
+                    let slot_idx = entry.slot_idx;
                     let mut obj = pop!();
                     let field_name = unsafe { &*field };
 
@@ -1890,11 +2341,9 @@ impl Actor
                                 let class_id = obj.class_id;
 
                                 // Update the cache
-                                self.insns[pc - 1] = Insn::get_field {
-                                    field,
-                                    class_id,
-                                    slot_idx: slot_idx as u32,
-                                };
+                                let entry = GetFieldEntry { field, class_id, slot_idx: slot_idx as u32 };
+                                let entry_idx = self.insns.add_get_field_entry(entry);
+                                self.insns.isns[pc - 1] = OptmisedInsn { opcode: Opcode::get_field { entry_idx } };
 
                                 obj.get(slot_idx as usize)
                             };
@@ -1917,7 +2366,7 @@ impl Actor
                     push!(val);
                 }
 
-                Insn::get_index => {
+                Opcode::get_index => {
                     let idx = pop!();
                     let mut arr = pop!();
 
@@ -1946,7 +2395,7 @@ impl Actor
                     push!(val);
                 }
 
-                Insn::set_index => {
+                Opcode::set_index => {
                     let mut val = pop!();
                     let mut idx = pop!();
                     let mut arr = pop!();
@@ -1985,7 +2434,7 @@ impl Actor
                 }
 
                 // Create new empty array
-                Insn::arr_new { capacity } => {
+                Opcode::arr_new { capacity } => {
                     let capacity = capacity as usize;
 
                     self.gc_check(
@@ -1999,14 +2448,14 @@ impl Actor
 
                 // Append an element at the end of an array
                 // This instruction is used to construct array literals
-                Insn::arr_push => {
+                Opcode::arr_push => {
                     let val = pop!();
                     let mut array = pop!();
                     crate::array::array_push(self, array, val).unwrap();
                 }
 
                 // Clone a bytearray
-                Insn::ba_clone => {
+                Opcode::ba_clone => {
                     let mut val = pop!();
                     let ba = val.unwrap_ba();
 
@@ -2022,7 +2471,7 @@ impl Actor
                 }
 
                 // Jump if true
-                Insn::if_true { target_ofs } => {
+                Opcode::if_true { target_ofs } => {
                     let v = pop!();
 
                     match v {
@@ -2033,7 +2482,7 @@ impl Actor
                 }
 
                 // Jump if false
-                Insn::if_false { target_ofs } => {
+                Opcode::if_false { target_ofs } => {
                     let v = pop!();
 
                     match v {
@@ -2044,32 +2493,43 @@ impl Actor
                 }
 
                 // Unconditional jump
-                Insn::jump { target_ofs } => {
+                Opcode::jump { target_ofs } => {
                     pc = ((pc as i64) + (target_ofs as i64)) as usize
                 }
 
                 // call (arg0, arg1, ..., argN, fun)
-                Insn::call { argc } => {
+                Opcode::call { argc } => {
                     let fun = pop!();
+                    let argc: u8 = argc as u8;
                     call_fun!(fun, argc);
                 }
 
                 // call_direct (arg0, arg1, ..., argN)
-                Insn::call_direct { fun_id, argc } => {
+                Opcode::call_direct { entry_idx } => {
+                    let entry = self.insns.call_direct_entry(entry_idx);
+                    let fun_id = entry.fun_id;
+                    let argc = entry.argc;
                     let this_pc = pc - 1;
                     let fun_entry = call_fun!(Value::Fun(fun_id), argc);
 
                     // Patch the instruction to jump directly to the entry point next time
-                    self.insns[this_pc] = Insn::call_pc {
+                    let entry = CallPcEntry {
                         entry_pc: fun_entry.entry_pc.try_into().unwrap(),
                         fun_id,
                         num_locals: fun_entry.num_locals.try_into().unwrap(),
-                        argc
+                        argc,
                     };
+                    let entry_idx = self.insns.add_call_pc_entry(entry);
+                    self.insns.isns[this_pc] = OptmisedInsn { opcode: Opcode::call_pc { entry_idx } };
                 }
 
                 // call_pc (arg0, arg1, ..., argN)
-                Insn::call_pc { entry_pc, fun_id, num_locals, argc } => {
+                Opcode::call_pc { entry_idx } => {
+                    let entry = self.insns.call_pc_entry(entry_idx);
+                    let fun_id = entry.fun_id;
+                    let entry_pc = entry.entry_pc;
+                    let num_locals = entry.num_locals;
+                    let argc = entry.argc;
                     self.frames.push(StackFrame {
                         argc,
                         fun: Value::Fun(fun_id),
@@ -2087,7 +2547,10 @@ impl Actor
 
                 // Call a method with a known name
                 // call_method (self, arg0, ..., argN)
-                Insn::call_method { name, argc } => {
+                Opcode::call_method { entry_idx } => {
+                    let entry = self.insns.call_method_entry(entry_idx);
+                    let name = entry.name;
+                    let argc = entry.argc;
                     let method_name = unsafe { &*name };
                     let self_val = self.stack[self.stack.len() - (1 + argc as usize)];
 
@@ -2103,7 +2566,7 @@ impl Actor
                             let fun_entry = call_fun!(Value::Fun(fun_id), argc + 1);
 
                             // Patch this instruction to avoid the method lookup next time
-                            self.insns[this_pc] = Insn::call_method_pc {
+                            let entry = CallMethodPcEntry {
                                 name,
                                 argc: argc.try_into().unwrap(),
                                 class_id: obj.class_id,
@@ -2111,6 +2574,8 @@ impl Actor
                                 fun_id,
                                 num_locals: fun_entry.num_locals.try_into().unwrap(),
                             };
+                            let entry_idx = self.insns.add_call_method_pc_entry(entry);
+                            self.insns.isns[this_pc] = OptmisedInsn { opcode: Opcode::call_method_pc { entry_idx } };
                         }
 
                         _ => {
@@ -2125,7 +2590,14 @@ impl Actor
                     };
                 }
 
-                Insn::call_method_pc { name, argc, class_id, entry_pc, fun_id, num_locals } => {
+                Opcode::call_method_pc { entry_idx } => {
+                    let entry = self.insns.call_method_pc_entry(entry_idx);
+                    let name = entry.name;
+                    let argc = entry.argc;
+                    let class_id = entry.class_id;
+                    let entry_pc = entry.entry_pc;
+                    let fun_id = entry.fun_id;
+                    let num_locals = entry.num_locals;
                     let self_val = self.stack[self.stack.len() - (1 + argc as usize)];
 
                     // Guard that self is an object with a matching class id
@@ -2155,13 +2627,15 @@ impl Actor
 
                     // The guard fail, deoptimize this instruction and try again
                     pc -= 1;
-                    self.insns[pc] = Insn::call_method {
+                    let entry = CallMethodEntry {
                         name,
                         argc: argc.into(),
                     };
+                    let entry_idx = self.insns.add_call_method_entry(entry);
+                    self.insns.isns[pc] = OptmisedInsn { opcode: Opcode::call_method { entry_idx } };
                 }
 
-                Insn::ret => {
+                Opcode::ret => {
                     if self.stack.len() <= bp {
                         error!("ret", "no return value on stack");
                     }
@@ -2192,7 +2666,7 @@ impl Actor
                 }
 
                 #[allow(unreachable_patterns)]
-                _ => error!("unknown opcode {:?}", insn)
+                _ => error!("unknown opcode {:?}", opcode)
             }
         }
     }
