@@ -659,7 +659,6 @@ impl Actor
             // Perform a GC pass to copy messages into the main allocator
             self.gc_collect(0, &mut []);
 
-            println!("Performing message allocator GC");
 
             // Clear the contents of the message allocator
             *msg_alloc = Alloc::with_size(msg_alloc.mem_size());
@@ -872,12 +871,6 @@ impl Actor
                 deepcopy(**val, dst_alloc, dst_map)?;
             }
 
-            println!(
-                "GC copied {} values, {} bytes free",
-                thousands_sep(dst_map.len()),
-                thousands_sep(dst_alloc.bytes_free()),
-            );
-
             remap(dst_map);
 
             Ok(())
@@ -893,7 +886,6 @@ impl Actor
             new_val
         }
 
-        println!("Running GC cycle, {} bytes free", self.alloc.bytes_free());
         let start_time = crate::host::get_time_ms();
 
         let mut new_mem_size = self.alloc.mem_size();
@@ -922,11 +914,6 @@ impl Actor
                 new_mem_size = std::cmp::max(
                     (new_mem_size * 3) / 2,
                     new_mem_size + bytes_needed,
-                );
-
-                println!(
-                    "Increasing heap size to {} bytes",
-                    thousands_sep(new_mem_size),
                 );
 
                 // Recreate the target allocator
@@ -989,7 +976,6 @@ impl Actor
 
         let end_time = crate::host::get_time_ms();
         let gc_time = end_time - start_time;
-        println!("GC time: {} ms", gc_time);
     }
 
     /// Ensure that at least bytes_needed of free space are available in the
